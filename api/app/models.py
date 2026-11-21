@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional, Union
+from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
 def to_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -122,3 +123,41 @@ class CorrectRequest(BaseModel):
     valid_from: AwareDatetime
     valid_to: AwareDatetime
     watershed: str = Field(min_length=1)
+
+
+# ---------------------------------------------------------------------------
+# 追溯响应
+# ---------------------------------------------------------------------------
+
+class TraceChainLink(BaseModel):
+    """追溯链上的一版归属时段."""
+
+    period_id: int
+    version_no: int
+    version_id: UUID
+    watershed: str
+    valid_from: datetime
+    valid_to: Optional[datetime]
+    status: str  # superseded=已被接续取代 | current=当前生效版 | last_confirmed=断点前最后确认版
+
+
+class TraceBreak(BaseModel):
+    """断点: 链上时段被其他入口/直连 SQL 改动或删除, 链到此为止(改回原值也不续接)."""
+
+    after_period_id: int
+    after_version_no: int
+    reason: str  # period_modified | period_deleted
+    live_version_no: Optional[int] = None  # 该时段当前在线版本号(已删除时为 None)
+    detail: str
+
+
+class TraceResponse(BaseModel):
+    """追溯结果: 从源版本出发沿接续关系走到头的链 + 是否完整/断点."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    version_id: UUID
+    at: datetime
+    complete: bool
+    chain: list[TraceChainLink]
+    break_point: Optional[TraceBreak] = Field(default=None, alias="break")

@@ -409,3 +409,383 @@ def test_unrelated_stations_both_commit(client):
     t2 = threading.Thread(target=work, args=(sid2, "s2"))
     t1.start(); t2.start(); t1.join(timeout=30); t2.join(timeout=30)
     assert results == {"s1": 201, "s2": 201}
+
+
+# ---------------------------------------------------------------------------
+# 归属时段版本与追溯
+# ---------------------------------------------------------------------------
+
+def trace(client: httpx.Client, version_id: str, at: str) -> httpx.Response:
+    return client.get("/trace", params={"version_id": version_id, "at": at})
+
+
+def mk_station_with_period(client: httpx.Client, sid: str, ws: str = "WS-A",
+                           vf: str = "2020-01-01T00:00:00Z",
+                           vt: str = "2023-01-01T00:00:00Z") -> None:
+    mk_station(client, sid)
+    r = changeset(client, [
+        {"op": "insert_period", "station_id": sid, "watershed": ws,
+         "valid_from": vf, "valid_to": vt},
+    ])
+    assert r.status_code == 201, r.text
+
+
+def only_period(client: httpx.Client, sid: str) -> dict:
+    ps = periods(client, sid)
+    assert len(ps) == 1, ps
+    return ps[0]
+
+
+def test_feeds_carry_period_version_identity(client):
+    """两个供数接口都返回归属时段版本标识, 且与时段当前版一致."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    r = changeset(client, [
+        {"op": "insert_observation", "station_id": sid,
+         "observed_at": "2020-06-01T00:00:00Z", "value": 1.0},
+    ])
+    assert r.status_code == 201, r.text
+
+    p = only_period(client, sid)
+    assert p["version_no"] == 1
+    for url in (f"/stations/{sid}/observations", f"/attributed-observations?station_id={sid}"):
+        resp = client.get(url)
+        assert resp.status_code == 200, resp.text
+        obs = resp.json()
+        assert len(obs) == 1
+        assert obs[0]["period_version_id"] == p["version_id"]
+        assert obs[0]["period_version_no"] == 1
+
+
+def test_split_generates_new_versions_and_trace(client):
+    """拆分: 沿用原编号的一侧也生成新版本; 凭拆分前收到的版本标识可追溯两半."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    r = changeset(client, [
+        {"op": "insert_observation", "station_id": sid,
+         "observed_at": "2020-06-01T00:00:00Z", "value": 1.0},
+        {"op": "insert_observation", "station_id": sid,
+         "observed_at": "2022-06-01T00:00:00Z", "value": 2.0},
+    ])
+    assert r.status_code == 201, r.text
+    p0 = only_period(client, sid)
+    vid0 = p0["version_id"]  # 下游拆分前收到的版本标识
+
+    r = client.post(f"/periods/{p0['period_id']}/split",
+                    json={"at": "2021-01-01T00:00:00Z", "right_watershed": "WS-B"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    # 沿用原编号的一侧也生成了新版本
+    assert body["left_period_id"] == p0["period_id"]
+    assert body["left_version_no"] == 2
+    assert body["left_version_id"] != vid0
+    assert body["right_period_id"] != p0["period_id"]
+    assert body["right_version_no"] == 1
+
+    # 拆分后两条观测分属不同版本
+    obs = observations(client, sid)
+    assert obs[0]["period_version_id"] == body["left_version_id"]
+    assert obs[1]["period_version_id"] == body["right_version_id"]
+
+    # 追溯左半时刻: 链 = [旧版, 左半新版], 完整
+    r = trace(client, vid0, "2020-06-01T00:00:00Z")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["complete"] is True and d["break"] is None
+    assert [(l["period_id"], l["version_no"], l["watershed"], l["status"]) for l in d["chain"]] == [
+        (p0["period_id"], 1, "WS-A", "superseded"),
+        (p0["period_id"], 2, "WS-A", "current"),
+    ]
+    assert d["chain"][0]["valid_to"] == "2023-01-01T00:00:00Z"
+    assert d["chain"][1]["valid_to"] == "2021-01-01T00:00:00Z"
+
+    # 追溯右半时刻: 链 = [旧版, 右半新版 WS-B], 完整
+    r = trace(client, vid0, "2022-06-01T00:00:00Z")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["complete"] is True
+    assert [(l["period_id"], l["version_no"], l["watershed"], l["status"]) for l in d["chain"]] == [
+        (p0["period_id"], 1, "WS-A", "superseded"),
+        (body["right_period_id"], 1, "WS-B", "current"),
+    ]
+
+    # 源版本即当前版时, 链长为 1
+    r = trace(client, body["right_version_id"], "2022-06-01T00:00:00Z")
+    assert r.status_code == 200 and r.json()["complete"] is True
+    assert len(r.json()["chain"]) == 1
+
+
+def test_trace_rejects_uncovered_moment_and_unknown_version(client):
+    """源版本不覆盖采样时刻 -> 422; 版本标识不存在 -> 404. 左闭右开边界."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    p = only_period(client, sid)
+    vid = p["version_id"]
+
+    # 早于 valid_from
+    r = trace(client, vid, "2019-12-31T23:59:59Z")
+    assert r.status_code == 422 and "does not contain" in r.json()["detail"]
+    # 恰在 valid_to (右开, 不覆盖)
+    r = trace(client, vid, "2023-01-01T00:00:00Z")
+    assert r.status_code == 422 and "does not contain" in r.json()["detail"]
+    # 恰在 valid_from (左闭, 覆盖)
+    r = trace(client, vid, "2020-01-01T00:00:00Z")
+    assert r.status_code == 200 and r.json()["complete"] is True
+    # 未知版本标识
+    r = trace(client, "00000000-0000-0000-0000-000000000000", "2020-06-01T00:00:00Z")
+    assert r.status_code == 404
+
+
+def test_correct_then_trace(client):
+    """历史更正: 凭更正前的版本标识追溯, 链经过更正段; 区间内外各归其段."""
+    sid = new_sid()
+    mk_station_with_period(client, sid, ws="WS-OLD")
+    p0 = only_period(client, sid)
+    vid0 = p0["version_id"]
+
+    r = client.post(f"/stations/{sid}/correct", json={
+        "valid_from": "2021-01-01T00:00:00Z",
+        "valid_to": "2022-01-01T00:00:00Z",
+        "watershed": "WS-NEW",
+    })
+    assert r.status_code == 201, r.text
+    new_ids = r.json()["new_period_ids"]
+    assert len(new_ids) == 3
+
+    # 更正区间内 -> 中段 WS-NEW
+    d = trace(client, vid0, "2021-06-01T00:00:00Z").json()
+    assert d["complete"] is True
+    assert [(l["period_id"], l["watershed"], l["status"]) for l in d["chain"]] == [
+        (p0["period_id"], "WS-OLD", "superseded"),
+        (new_ids[1], "WS-NEW", "current"),
+    ]
+    # 更正区间外 -> 左段 WS-OLD
+    d = trace(client, vid0, "2020-06-01T00:00:00Z").json()
+    assert d["complete"] is True
+    assert [(l["period_id"], l["watershed"]) for l in d["chain"]] == [
+        (p0["period_id"], "WS-OLD"), (new_ids[0], "WS-OLD"),
+    ]
+    # 右段
+    d = trace(client, vid0, "2022-06-01T00:00:00Z").json()
+    assert d["complete"] is True
+    assert [(l["period_id"], l["watershed"]) for l in d["chain"]] == [
+        (p0["period_id"], "WS-OLD"), (new_ids[2], "WS-OLD"),
+    ]
+
+
+def test_transfer_then_trace(client):
+    """转属: 凭转属前的版本标识追溯, 跨过转属时刻归属变为新流域."""
+    sid = new_sid()
+    mk_station_with_period(client, sid, vt=None)
+    p0 = only_period(client, sid)
+    vid0 = p0["version_id"]
+
+    r = client.post(f"/stations/{sid}/transfer",
+                    json={"at": "2021-01-01T00:00:00Z", "new_watershed": "WS-B"})
+    assert r.status_code == 201, r.text
+    new_pid = r.json()["new_period_id"]
+
+    d = trace(client, vid0, "2020-06-01T00:00:00Z").json()
+    assert d["complete"] is True
+    assert [(l["period_id"], l["version_no"], l["watershed"]) for l in d["chain"]] == [
+        (p0["period_id"], 1, "WS-A"), (p0["period_id"], 2, "WS-A"),
+    ]
+    d = trace(client, vid0, "2021-06-01T00:00:00Z").json()
+    assert d["complete"] is True
+    assert [(l["period_id"], l["version_no"], l["watershed"]) for l in d["chain"]] == [
+        (p0["period_id"], 1, "WS-A"), (new_pid, 1, "WS-B"),
+    ]
+
+
+def test_merge_then_trace_multi_hop(client):
+    """合并: 从原始版出发经拆分右段跳到合并版, 多跳链完整."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    p0 = only_period(client, sid)
+    vid0 = p0["version_id"]
+    r = client.post(f"/periods/{p0['period_id']}/split",
+                    json={"at": "2021-01-01T00:00:00Z", "right_watershed": "WS-B"})
+    assert r.status_code == 201, r.text
+    right_pid = r.json()["right_period_id"]
+    r = client.post(f"/stations/{sid}/merge", json={"at": "2021-01-01T00:00:00Z"})
+    assert r.status_code == 201, r.text
+
+    d = trace(client, vid0, "2022-06-01T00:00:00Z").json()
+    assert d["complete"] is True
+    assert [(l["period_id"], l["version_no"], l["watershed"], l["status"]) for l in d["chain"]] == [
+        (p0["period_id"], 1, "WS-A", "superseded"),
+        (right_pid, 1, "WS-B", "superseded"),
+        (p0["period_id"], 3, "WS-A", "current"),
+    ]
+
+
+def test_direct_sql_modify_breaks_chain_and_no_reconnect(client):
+    """直连 SQL 改动链上时段 -> 断点 period_modified; 改回原值也不续接."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    p0 = only_period(client, sid)
+    vid0 = p0["version_id"]
+    r = client.post(f"/periods/{p0['period_id']}/split",
+                    json={"at": "2021-01-01T00:00:00Z", "right_watershed": "WS-B"})
+    assert r.status_code == 201, r.text
+    right_pid = r.json()["right_period_id"]
+    assert trace(client, vid0, "2022-06-01T00:00:00Z").json()["complete"] is True
+
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("UPDATE attribution_periods SET watershed='WS-X' WHERE period_id=%s", (right_pid,))
+    d = trace(client, vid0, "2022-06-01T00:00:00Z").json()
+    assert d["complete"] is False
+    assert d["break"]["reason"] == "period_modified"
+    assert d["break"]["after_period_id"] == right_pid
+    assert d["break"]["after_version_no"] == 1
+    assert d["break"]["live_version_no"] == 2
+    # 已确认的链仍然返回, 链尾标记 last_confirmed
+    assert [(l["period_id"], l["version_no"], l["status"]) for l in d["chain"]] == [
+        (p0["period_id"], 1, "superseded"),
+        (right_pid, 1, "last_confirmed"),
+    ]
+
+    # 改回原值: 版本号继续递增, 链不续接
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("UPDATE attribution_periods SET watershed='WS-B' WHERE period_id=%s", (right_pid,))
+    d = trace(client, vid0, "2022-06-01T00:00:00Z").json()
+    assert d["complete"] is False
+    assert d["break"]["reason"] == "period_modified"
+    assert d["break"]["live_version_no"] == 3
+
+
+def test_changeset_update_breaks_chain(client):
+    """其他入口(变更集 update_period)改动链上时段 -> 断点 period_modified."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    p0 = only_period(client, sid)
+    vid0 = p0["version_id"]
+
+    r = changeset(client, [
+        {"op": "update_period", "period_id": p0["period_id"], "watershed": "WS-Z"},
+    ])
+    assert r.status_code == 201, r.text
+    d = trace(client, vid0, "2020-06-01T00:00:00Z").json()
+    assert d["complete"] is False
+    assert d["break"]["reason"] == "period_modified"
+    assert d["break"]["live_version_no"] == 2
+    assert len(d["chain"]) == 1 and d["chain"][0]["status"] == "last_confirmed"
+
+
+def test_direct_sql_delete_breaks_chain(client):
+    """直连 SQL 删除链上时段 -> 断点 period_deleted."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)  # 无观测, 删除不违反覆盖约束
+    p0 = only_period(client, sid)
+    vid0 = p0["version_id"]
+    r = client.post(f"/periods/{p0['period_id']}/split",
+                    json={"at": "2021-01-01T00:00:00Z", "right_watershed": "WS-B"})
+    assert r.status_code == 201, r.text
+    right_pid = r.json()["right_period_id"]
+
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("DELETE FROM attribution_periods WHERE period_id=%s", (right_pid,))
+    d = trace(client, vid0, "2022-06-01T00:00:00Z").json()
+    assert d["complete"] is False
+    assert d["break"]["reason"] == "period_deleted"
+    assert d["break"]["live_version_no"] is None
+    assert [(l["period_id"], l["status"]) for l in d["chain"]] == [
+        (p0["period_id"], "superseded"), (right_pid, "last_confirmed"),
+    ]
+    # 左半时刻的链不受影响
+    assert trace(client, vid0, "2020-06-01T00:00:00Z").json()["complete"] is True
+
+
+def test_trace_reads_only_committed_state(client):
+    """一次追溯只读同一已提交状态: 未提交的改动对追溯不可见."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    p0 = only_period(client, sid)
+    vid0 = p0["version_id"]
+
+    holder = psycopg.connect(DSN)  # 默认 READ COMMITTED, 非 autocommit
+    try:
+        holder.execute("UPDATE attribution_periods SET watershed='WS-SNEAKY' "
+                       "WHERE period_id=%s", (p0["period_id"],))
+        # 未提交: 追溯仍看到已提交的完整链
+        d = trace(client, vid0, "2020-06-01T00:00:00Z").json()
+        assert d["complete"] is True
+        assert d["chain"][0]["watershed"] == "WS-A"
+        holder.commit()
+    finally:
+        holder.close()
+    # 提交后: 断点可见
+    d = trace(client, vid0, "2020-06-01T00:00:00Z").json()
+    assert d["complete"] is False
+    assert d["break"]["reason"] == "period_modified"
+
+
+def test_rejected_split_leaves_no_versions_or_succession(client):
+    """拆分被参数校验拒绝(422) -> 不产生任何新版本/接续, 原时段保持 v1."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    p0 = only_period(client, sid)
+
+    r = client.post(f"/periods/{p0['period_id']}/split",
+                    json={"at": "2019-12-31T00:00:00Z"})  # 不在时段内
+    assert r.status_code == 422, r.text
+
+    p = only_period(client, sid)
+    assert p["version_no"] == 1 and p["version_id"] == p0["version_id"]
+    with psycopg.connect(DSN) as c:
+        n_succ = c.execute(
+            "SELECT count(*) FROM period_succession WHERE pred_period_id=%s", (p0["period_id"],)
+        ).fetchone()[0]
+        n_ver = c.execute(
+            "SELECT count(*) FROM period_versions WHERE period_id=%s", (p0["period_id"],)
+        ).fetchone()[0]
+    assert n_succ == 0
+    assert n_ver == 1
+
+
+def test_succession_rolls_back_with_period_changes(client):
+    """接续关系与时段变更同一事务: 回滚则两者都不留痕."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    p0 = only_period(client, sid)
+    with psycopg.connect(DSN) as c:
+        before = c.execute(
+            "SELECT (SELECT count(*) FROM period_versions), (SELECT count(*) FROM period_succession)"
+        ).fetchone()
+
+    conn = psycopg.connect(DSN)
+    try:
+        conn.execute("UPDATE attribution_periods SET valid_to='2021-01-01 00:00+00' "
+                     "WHERE period_id=%s", (p0["period_id"],))
+        conn.execute("INSERT INTO attribution_periods (station_id, watershed, valid_from, valid_to)"
+                     " VALUES (%s, 'WS-B', '2021-01-01 00:00+00', '2023-01-01 00:00+00')", (sid,))
+        conn.execute(
+            "INSERT INTO period_succession (pred_period_id, pred_version_no,"
+            " succ_period_id, succ_version_no) VALUES (%s, 1, %s, 2)",
+            (p0["period_id"], p0["period_id"]),
+        )
+        conn.rollback()
+    finally:
+        conn.close()
+
+    with psycopg.connect(DSN) as c:
+        after = c.execute(
+            "SELECT (SELECT count(*) FROM period_versions), (SELECT count(*) FROM period_succession)"
+        ).fetchone()
+        n = c.execute("SELECT count(*) FROM attribution_periods WHERE station_id=%s",
+                      (sid,)).fetchone()[0]
+    assert after == before
+    assert n == 1
+
+
+def test_audit_tables_append_only(client):
+    """版本存档与接续关系表 append-only: UPDATE/DELETE/TRUNCATE 均被拒."""
+    sid = new_sid()
+    mk_station_with_period(client, sid)
+    with psycopg.connect(DSN, autocommit=True) as c:
+        with pytest.raises(psycopg.errors.RaiseException):
+            c.execute("UPDATE period_versions SET watershed='X'")
+        with pytest.raises(psycopg.errors.RaiseException):
+            c.execute("DELETE FROM period_succession")
+        with pytest.raises(psycopg.errors.RaiseException):
+            c.execute("TRUNCATE period_succession")

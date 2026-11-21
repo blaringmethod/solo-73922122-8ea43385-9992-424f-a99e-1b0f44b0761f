@@ -30,6 +30,8 @@ CREATE TABLE attribution_periods (
     watershed   text NOT NULL,
     valid_from  timestamptz NOT NULL,
     valid_to    timestamptz,                       -- NULL = 至今有效
+    version_no  integer NOT NULL DEFAULT 1,        -- 每次 UPDATE 由触发器 +1
+    version_id  uuid NOT NULL DEFAULT gen_random_uuid(),  -- 每版一个标识, 供数/追溯用
     CONSTRAINT period_bounds_ok CHECK (valid_to IS NULL OR valid_to > valid_from)
 );
 
@@ -44,6 +46,99 @@ CREATE INDEX periods_station_range_idx
     ON attribution_periods USING gist (station_id, tstzrange(valid_from, valid_to, '[)'));
 CREATE INDEX observations_station_time_idx
     ON observations (station_id, observed_at);
+
+-- ----------------------------------------------------------------------------
+-- 归属时段版本与接续关系(供下游追溯)
+--
+--   * period_versions: 每个时段每一版的不可变存档(append-only)。行触发器在
+--     INSERT/UPDATE 时记录新版 —— 任何写路径(API/变更集/直连 SQL)都会留下版本;
+--     存档与时段变更处于同一事务, 随之一起提交或回滚
+--   * period_succession: 接续关系(append-only), 仅由 转属/拆分/合并/历史更正
+--     端点在与时段变更相同的事务内写入。变更集裸 update/delete_period 或直连
+--     SQL 改动时段不会产生接续 —— 追溯链在该版之后断开(断点), 即使事后改回
+--     原值也不会续接(版本号只会单调递增, 不会回到旧版)
+--   * 两张审计表禁止 UPDATE/DELETE/TRUNCATE
+-- ----------------------------------------------------------------------------
+CREATE TABLE period_versions (
+    version_id  uuid PRIMARY KEY,
+    period_id   bigint NOT NULL,        -- 逻辑关联, 不加外键: 时段删除后历史仍保留
+    version_no  integer NOT NULL,
+    station_id  text NOT NULL,
+    watershed   text NOT NULL,
+    valid_from  timestamptz NOT NULL,
+    valid_to    timestamptz,
+    recorded_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT period_versions_unique UNIQUE (period_id, version_no)
+);
+
+CREATE TABLE period_succession (
+    pred_period_id  bigint NOT NULL,
+    pred_version_no integer NOT NULL,
+    succ_period_id  bigint NOT NULL,
+    succ_version_no integer NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT period_succession_pk PRIMARY KEY
+        (pred_period_id, pred_version_no, succ_period_id, succ_version_no),
+    CONSTRAINT period_succession_pred_fk FOREIGN KEY (pred_period_id, pred_version_no)
+        REFERENCES period_versions (period_id, version_no),
+    CONSTRAINT period_succession_succ_fk FOREIGN KEY (succ_period_id, succ_version_no)
+        REFERENCES period_versions (period_id, version_no)
+);
+
+CREATE INDEX period_succession_pred_idx
+    ON period_succession (pred_period_id, pred_version_no);
+
+-- UPDATE 时段: 版本号 +1 并换发 version_id (任何写路径都经过此触发器)
+CREATE OR REPLACE FUNCTION bump_period_version() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.version_no := OLD.version_no + 1;
+    NEW.version_id := gen_random_uuid();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER periods_bump_version
+    BEFORE UPDATE ON attribution_periods
+    FOR EACH ROW EXECUTE FUNCTION bump_period_version();
+
+-- INSERT/UPDATE 之后把新版写入存档(与变更同事务)
+CREATE OR REPLACE FUNCTION archive_period_version() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO period_versions
+        (version_id, period_id, version_no, station_id, watershed, valid_from, valid_to)
+    VALUES
+        (NEW.version_id, NEW.period_id, NEW.version_no, NEW.station_id, NEW.watershed,
+         NEW.valid_from, NEW.valid_to);
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER periods_archive_version
+    AFTER INSERT OR UPDATE ON attribution_periods
+    FOR EACH ROW EXECUTE FUNCTION archive_period_version();
+
+-- 版本存档与接续关系为 append-only 审计数据
+CREATE OR REPLACE FUNCTION forbid_audit_mutation() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION '% is append-only: % is not allowed', TG_TABLE_NAME, TG_OP;
+END;
+$$;
+
+CREATE TRIGGER versions_no_mutation
+    BEFORE UPDATE OR DELETE ON period_versions
+    FOR EACH ROW EXECUTE FUNCTION forbid_audit_mutation();
+CREATE TRIGGER versions_no_truncate
+    BEFORE TRUNCATE ON period_versions
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_audit_mutation();
+CREATE TRIGGER succession_no_mutation
+    BEFORE UPDATE OR DELETE ON period_succession
+    FOR EACH ROW EXECUTE FUNCTION forbid_audit_mutation();
+CREATE TRIGGER succession_no_truncate
+    BEFORE TRUNCATE ON period_succession
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_audit_mutation();
 
 -- ----------------------------------------------------------------------------
 -- 单站完整性强检: 无重叠时段 + 每条观测都有归属
@@ -191,7 +286,8 @@ CREATE TRIGGER observations_no_truncate
     FOR EACH STATEMENT EXECUTE FUNCTION forbid_truncate();
 
 -- ----------------------------------------------------------------------------
--- 供数视图: 按采样时刻关联流域 (READ COMMITTED 下只见完整已提交状态)
+-- 供数视图: 按采样时刻关联流域 (READ COMMITTED 下只见完整已提交状态);
+-- 附带归属时段版本标识(period_version_id), 下游凭它调用 /trace 追溯归属变迁
 -- ----------------------------------------------------------------------------
 CREATE VIEW observation_attribution AS
 SELECT o.observation_id,
@@ -199,6 +295,8 @@ SELECT o.observation_id,
        o.observed_at,
        o.value,
        p.period_id,
+       p.version_no AS period_version_no,
+       p.version_id AS period_version_id,
        p.watershed,
        p.valid_from AS period_valid_from,
        p.valid_to   AS period_valid_to
